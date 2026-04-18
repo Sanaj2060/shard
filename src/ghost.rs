@@ -83,4 +83,41 @@ impl Filesystem for ShardGhost {
         }
         reply.ok();
     }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        _parent: u64,
+        _name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        // Return a virtual file attribute to the kernel so it thinks the file was created
+        reply.created(&TTL, &FILE_ATTR, 0, 0, 0);
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<fuser::TimeOrNow>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        // Just echo back the standard file attributes
+        // This satisfies tools that try to 'touch' or set permissions on the file
+        reply.attr(&TTL, &FILE_ATTR);
+    }
 }
