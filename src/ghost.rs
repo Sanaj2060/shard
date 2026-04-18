@@ -68,18 +68,24 @@ impl Filesystem for ShardGhost {
     fn write(&mut self, _req: &Request, _ino: u64, _fh: u64, _offset: i64, data: &[u8], _write_flags: u32, _flags: i32, _lock_owner: Option<u64>, reply: ReplyWrite) {
         let buffer = self.buffer.clone();
         let wal = self.wal.clone();
+        
+        // 1. Capture the length BEFORE moving anything
+        let data_len = data.len(); 
         let data_vec = data.to_vec();
 
-        // 1. Zero-Latency Buffer Write
-        if buffer.write(&data_vec).is_ok() {
-            // 2. Async Persistence (Fire-and-forget)
-            // This happens in the background and does not block the return
+        // 2. Zero-Latency Buffer Write
+        // We use the original slice here to avoid any ownership issues
+        if buffer.write(data).is_ok() {
+            
+            // 3. Fire-and-Forget Persistence
+            // Move the cloned data_vec into the background
             self.rt_handle.spawn(async move {
                 let _ = wal.append(&data_vec).await;
             });
 
-            // 3. Immediate Acknowledge to the Kernel
-            reply.written(data_vec.len() as u32);
+            // 4. Immediate Acknowledge
+            // Use the captured length variable
+            reply.written(data_len as u32);
         } else {
             reply.error(libc::ENOSPC);
         }
