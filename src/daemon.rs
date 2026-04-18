@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use anyhow::Result;
 use crate::buffer::AtomicBuffer;
 use crate::wal::Wal;
+use crate::ghost::ShardGhost;
 use std::sync::Arc;
 use tokio::fs;
-use notify::{Watcher, RecursiveMode, Config};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct ShardConfig {
@@ -19,105 +19,62 @@ pub struct Daemon {
     buffer: Arc<AtomicBuffer>,
     wal: Arc<Wal>,
     pub config: ShardConfig,
-    watch_path: PathBuf,
-    processed_files: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    backing_path: PathBuf,
 }
 
 impl Daemon {
-    pub fn new(config: ShardConfig, watch_path: PathBuf) -> Result<Self> {
-        let buffer = Arc::new(AtomicBuffer::new(watch_path.join(".shard.buffer"), config.buffer_size)?);
+    pub fn new(config: ShardConfig, backing_path: PathBuf) -> Result<Self> {
+        let buffer = Arc::new(AtomicBuffer::new(backing_path.join(".shard.buffer"), config.buffer_size)?);
         let wal = Arc::new(Wal::new(&config.wal_path)?);
         Ok(Self { 
             buffer, 
             wal, 
             config, 
-            watch_path, 
-            processed_files: Arc::new(std::sync::Mutex::new(Vec::new())) 
+            backing_path,
         })
     }
 
-    pub async fn watch(&mut self, path: PathBuf, mut stop_rx: tokio::sync::oneshot::Receiver<()>) -> Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2048);
-
-        let mut watcher = notify::recommended_watcher(move |res| {
-            if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
-            }
-        })?;
-
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
-
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => break,
-                Some(event) = rx.recv() => {
-                    if event.kind.is_create() || event.kind.is_modify() {
-                        for p in event.paths {
-                            if p.is_file() && !p.file_name().unwrap().to_string_lossy().starts_with("shard") {
-                                let _ = self.process_file(p).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn process_file(&self, path: PathBuf) -> Result<()> {
-        // 1. Wait for file stability (ensure it's not being actively written)
-        let mut last_size = 0;
-        for _ in 0..5 {
-            if let Ok(metadata) = fs::metadata(&path).await {
-                let current_size = metadata.len();
-                if current_size == last_size && current_size > 0 {
-                    break;
-                }
-                last_size = current_size;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // 2. Read and ingest
-        let mut data = fs::read(&path).await?;
-        if data.is_empty() { return Ok(()); }
-        if !data.ends_with(b"\n") { data.push(b'\n'); }
-        
-        self.wal.append(&data).await?;
-        
-        let needs_flush = {
-            if self.buffer.write(&data).is_ok() {
-                self.processed_files.lock().unwrap().push(path);
-                self.buffer.len() > 10 * 1024 * 1024
-            } else {
-                true
-            }
+    pub async fn mount(&self, mount_point: PathBuf) -> Result<()> {
+        let ghost = ShardGhost {
+            buffer: self.buffer.clone(),
+            wal: self.wal.clone(),
+            rt_handle: tokio::runtime::Handle::current(),
         };
 
-        if needs_flush {
-            self.flush().await?;
-        }
+        // FUSE Mount options
+        let options = vec![
+            fuser::MountOption::AutoUnmount, 
+            fuser::MountOption::AllowOther
+        ];
+        
+        // Spawn asynchronous periodic background flusher
+        let daemon_clone = self.clone();
+        let flush_interval = self.config.flush_interval_secs;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(flush_interval)).await;
+                let _ = daemon_clone.flush().await;
+            }
+        });
+
+        // fuser::mount2 is a blocking thread, run it on a blocking task
+        println!("Shard Ghost Virtual Filesystem is intercepting at: {}", mount_point.display());
+        tokio::task::spawn_blocking(move || {
+            fuser::mount2(ghost, mount_point, &options).expect("Failed to mount FUSE. Ensure macFUSE/libfuse is installed.");
+        }).await?;
+
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let (data, files_to_delete) = {
-            let mut files = self.processed_files.lock().unwrap();
-            let data = self.buffer.drain();
-            if data.is_empty() { return Ok(()); }
-            
-            let files_to_delete: Vec<PathBuf> = files.drain(..).collect();
-            (data, files_to_delete)
-        };
+        let data = self.buffer.drain();
+        if data.is_empty() { return Ok(()); }
         
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
-        let final_name = self.watch_path.join(format!("shard_{}.block", ts));
+        let final_name = self.backing_path.join(format!("shard_block_{}.json", ts));
         
         fs::write(&final_name, data).await?;
-        
-        for f in files_to_delete {
-            let _ = fs::remove_file(f).await;
-        }
+        println!("Flushed block: {}", final_name.display());
         Ok(())
     }
 }
