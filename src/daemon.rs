@@ -77,4 +77,19 @@ impl Daemon {
         println!("Flushed block: {}", final_name.display());
         Ok(())
     }
+
+    pub async fn process_file(&self, path: PathBuf) -> Result<()> {
+        let metadata = fs::metadata(&path).await?;
+        if metadata.len() > (64 * 1024 * 1024) || metadata.len() == 0 { return Ok(()); }
+
+        let data = fs::read(&path).await?;
+        self.wal.append(&data).await?;
+        
+        if self.buffer.write(&data).is_ok() {
+            // Logic to track processed files would go here
+        } else {
+            self.flush().await?;
+        }
+        Ok(())
+    }
 }
