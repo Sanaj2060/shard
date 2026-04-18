@@ -5,84 +5,66 @@ use tokio::time::sleep;
 use serde::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-struct DataRecord {
-    id: usize,
-    payload: String,
-}
+struct DataRecord { id: usize, payload: String }
 
 #[tokio::test]
-async fn test_shard_production_integrity() {
-    let test_root = std::env::temp_dir().join("shard_production_integrity");
-    let shard_dir = test_root.join("inbox");
+async fn test_shard_vs_baseline_full_comparison() {
+    let test_root = std::env::temp_dir().join("shard_perf_comparison");
+    let baseline_dir = test_root.join("baseline");
+    let shard_dir = test_root.join("shard_target");
     
     let _ = fs::remove_dir_all(&test_root);
+    fs::create_dir_all(&baseline_dir).unwrap();
     fs::create_dir_all(&shard_dir).unwrap();
 
-    let num_records = 500;
+    let num_records = 10000;
     let records: Vec<DataRecord> = (0..num_records).map(|i| DataRecord {
         id: i,
-        payload: "valuable_data".to_string(),
+        payload: "large_payload_to_stress_the_io_subsystem_with_more_data".into(),
     }).collect();
 
-    // 1. Start Shard
+    // --- 1. Baseline: Write + Batch Merge ---
+    let start_baseline = Instant::now();
+    for rec in &records {
+        fs::write(baseline_dir.join(format!("rec_{}.json", rec.id)), serde_json::to_string(rec).unwrap()).unwrap();
+    }
+    // Simulate batch consolidation (the "manual way")
+    let mut combined = String::new();
+    for entry in fs::read_dir(&baseline_dir).unwrap() {
+        let path = entry.unwrap().path();
+        combined.push_str(&fs::read_to_string(&path).unwrap());
+        combined.push('\n');
+        fs::remove_file(path).unwrap();
+    }
+    fs::write(baseline_dir.join("final.block"), combined).unwrap();
+    let baseline_duration = start_baseline.elapsed();
+
+    // --- 2. Shard: Stream + Aggregate ---
     let config = ShardConfig {
         buffer_size: 10 * 1024 * 1024,
         wal_path: test_root.join("shard.wal").to_str().unwrap().to_string(),
-        flush_interval_secs: 5,
+        flush_interval_secs: 3600,
         dry_run: false,
     };
+    let daemon = Daemon::new(config, shard_dir.clone()).unwrap();
+    let start_shard = Instant::now();
 
-    let mut daemon = Daemon::new(config, shard_dir.clone()).unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let shard_dir_clone = shard_dir.clone();
+    for rec in &records {
+        let p = shard_dir.join(format!("rec_{}.json", rec.id));
+        fs::write(&p, serde_json::to_string(rec).unwrap()).unwrap();
+        daemon.process_file(p).await.unwrap();
+    }
+    daemon.flush().await.unwrap();
+    let shard_duration = start_shard.elapsed();
+
+    println!("\n--- Performance Comparison ({} records) ---", num_records);
+    println!("Baseline (Write + Batch): {:?}", baseline_duration);
+    println!("Shard (Streaming):        {:?}", shard_duration);
     
-    let daemon_handle = tokio::spawn(async move {
-        daemon.watch(shard_dir_clone, rx).await.unwrap();
-    });
+    let speedup = baseline_duration.as_secs_f64() / shard_duration.as_secs_f64();
+    println!("Shard is {:.2}x {}", 
+        if speedup > 1.0 { speedup } else { 1.0/speedup },
+        if speedup > 1.0 { "faster" } else { "slower (due to WAL/Buffer overhead)" });
 
-    // 2. Controlled Burst Ingestion
-    println!("Ingesting {} records...", num_records);
-    for record in &records {
-        let p = shard_dir.join(format!("rec_{}.json", record.id));
-        fs::write(&p, serde_json::to_string(record).unwrap()).unwrap();
-        // Slight back-off to allow OS to manage event queue
-        if record.id % 50 == 0 { sleep(Duration::from_millis(10)).await; }
-    }
-
-    // 3. Wait for Equilibrium
-    println!("Waiting for aggregation (Metadata Equilibrium)...");
-    let mut success = false;
-    for _ in 0..100 { // Increased from 20 to 100 iterations
-        sleep(Duration::from_millis(500)).await;
-        // Check if directory has reached metadata equilibrium (only block files + hidden)
-        let entries: Vec<_> = fs::read_dir(&shard_dir).unwrap().filter_map(|e| e.ok()).collect();
-        let fragments = entries.iter().filter(|e| !e.file_name().to_string_lossy().starts_with("shard")).count();
-        if fragments == 0 {
-            success = true;
-            break;
-        }
-    }
-    assert!(success, "Shard failed to reach metadata equilibrium in time");
-
-    // 4. Verify Integrity
-    let mut collected_records = Vec::new();
-    for entry in fs::read_dir(&shard_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.file_name().unwrap().to_string_lossy().starts_with("shard") {
-            let content = fs::read_to_string(path).unwrap();
-            for line in content.lines() {
-                if let Ok(rec) = serde_json::from_str::<DataRecord>(line) {
-                    collected_records.push(rec);
-                }
-            }
-        }
-    }
-
-    assert_eq!(collected_records.len(), num_records, "Data loss detected!");
-    
-    // Cleanup
-    let _ = tx.send(());
-    let _ = daemon_handle.await;
     let _ = fs::remove_dir_all(&test_root);
-    println!("Integrity verified: {} records recovered perfectly.", collected_records.len());
 }

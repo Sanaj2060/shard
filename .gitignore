@@ -10,3 +10,5 @@ shard.wal
 *.parquet
 onlyme.md
 sell.md
+*.wal
+*.buffer
