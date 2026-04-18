@@ -108,16 +108,15 @@ impl Filesystem for ShardGhost {
         _size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>, // Corrected from TimeOrNow
         _fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<u32>,
-        reply: fuser::ReplyAttr,
+        reply: ReplyAttr,
     ) {
         // Just echo back the standard file attributes
-        // This satisfies tools that try to 'touch' or set permissions on the file
         reply.attr(&TTL, &FILE_ATTR);
     }
 }
