@@ -16,11 +16,12 @@ async fn test_shard_ghost_performance() {
     let num_files = 10000;
     let data = b"{\"id\": 1, \"status\": \"intercepted\"}\n";
 
-    // 1. Setup Ghost Daemon
+    // --- 1. Setup Ghost Daemon ---
     let config = ShardConfig {
         buffer_size: 50 * 1024 * 1024,
         wal_path: backing_dir.join(".shard.wal").to_str().unwrap().to_string(),
-        flush_interval_secs: 5, // Flush every 5 seconds for the test
+        flush_interval_secs: 5,
+        dry_run: false, // <--- Add this line here
     };
 
     let daemon = Daemon::new(config, backing_dir.clone()).unwrap();
