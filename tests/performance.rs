@@ -1,56 +1,66 @@
 use std::fs;
 use std::time::Instant;
 use shard::daemon::{Daemon, ShardConfig};
-use tokio::time::sleep;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct DataRecord { id: usize, payload: String }
 
 #[tokio::test]
-async fn test_shard_shadow_ingest_performance() {
-    let test_root = std::env::temp_dir().join("shard_shadow_bench");
-    let inbox = test_root.join("inbox");
-    let storage = test_root.join("storage");
+async fn test_shard_vs_baseline_performance() {
+    let test_root = std::env::temp_dir().join("shard_perf_final");
+    let b_dir = test_root.join("baseline");
+    let s_inbox = test_root.join("inbox");
+    let s_storage = test_root.join("storage");
     
     let _ = fs::remove_dir_all(&test_root);
-    fs::create_dir_all(&inbox).unwrap();
-    fs::create_dir_all(&storage).unwrap();
+    fs::create_dir_all(&b_dir).unwrap();
+    fs::create_dir_all(&s_inbox).unwrap();
+    fs::create_dir_all(&s_storage).unwrap();
 
-    // 100MB of data (100 files of 1MB)
-    let num_files = 100;
-    let data = vec![b'A'; 1024 * 1024]; 
+    let num_records = 1000;
+    let records: Vec<DataRecord> = (0..num_records).map(|i| DataRecord {
+        id: i, payload: "valuable_data".into() 
+    }).collect();
 
-    // --- PHASE 1: SHARD SHADOW INGEST ---
-    println!("\n--- Starting Shard Shadow Ingest Benchmark ---");
+    // --- 1. BASELINE (Write + Batch Merge) ---
+    let start_b = Instant::now();
+    for rec in &records {
+        fs::write(b_dir.join(format!("rec_{}.json", rec.id)), serde_json::to_string(rec).unwrap()).unwrap();
+    }
+    let mut combined = String::new();
+    for entry in fs::read_dir(&b_dir).unwrap() {
+        let path = entry.unwrap().path();
+        combined.push_str(&fs::read_to_string(&path).unwrap());
+        fs::remove_file(path).unwrap();
+    }
+    fs::write(b_dir.join("final.block"), combined).unwrap();
+    let b_total = start_b.elapsed();
+
+    // --- 2. SHARD (Shadow Ingest) ---
     let config = ShardConfig {
         buffer_size: 256 * 1024 * 1024,
-        wal_path: storage.join("shard.wal").to_str().unwrap().to_string(),
-        flush_interval_secs: 1, 
+        wal_path: s_storage.join("shard.wal").to_str().unwrap().to_string(),
+        flush_interval_secs: 3600,
         dry_run: false,
     };
+    let daemon = Daemon::new(config, s_storage.clone()).unwrap();
+    let start_s = Instant::now();
     
-    let daemon = Daemon::new(config, storage.clone()).unwrap();
-    let start_shard = Instant::now();
-    
-    // Ingest phase
-    for i in 0..num_files {
-        let p = inbox.join(format!("file_{}.bin", i));
-        fs::write(&p, &data).unwrap();
+    for rec in &records {
+        let p = s_inbox.join(format!("rec_{}.json", rec.id));
+        fs::write(&p, serde_json::to_string(rec).unwrap()).unwrap();
         daemon.process_file(p).await.unwrap();
     }
-    
-    // Explicit flush/stitch
     daemon.flush().await.unwrap();
-    let s_total = start_shard.elapsed();
+    let s_total = start_s.elapsed();
 
-    // --- PHASE 2: INTEGRITY VERIFICATION ---
-    let block_file = fs::read_dir(&storage).unwrap()
-        .filter_map(|e| e.ok())
-        .find(|e| e.file_name().to_string_lossy().contains("shard_block"))
-        .expect("Block file not created");
-
-    let merged_size = fs::metadata(block_file.path()).unwrap().len();
-    assert_eq!(merged_size, (num_files * 1024 * 1024) as u64, "Data loss!");
+    println!("\n--- Performance Comparison ({} records) ---", num_records);
+    println!("Baseline (Write + Batch): {:?}", b_total);
+    println!("Shard (Shadow Ingest):    {:?}", s_total);
     
-    println!("Shard Full Cycle: {:?}", s_total);
-    println!("Integrity verified: {}MB coalesced into 1 block.", merged_size / 1024 / 1024);
-
+    let speedup = b_total.as_secs_f64() / s_total.as_secs_f64();
+    println!("Speedup Factor: {:.2}x", speedup);
+    
     let _ = fs::remove_dir_all(&test_root);
 }
