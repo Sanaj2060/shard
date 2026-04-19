@@ -1,16 +1,16 @@
 use memmap2::{MmapMut, MmapOptions};
-use std::fs::OpenOptions;
+use std::fs::{OpenOptions, File};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 
-pub struct AtomicBuffer {
+pub struct ShardV1 {
     mmap: MmapMut,
     tail: AtomicUsize,
     capacity: usize,
 }
 
-impl AtomicBuffer {
-    pub fn new(path: std::path::PathBuf, capacity: usize) -> Result<Self> {
+impl ShardV1 {
+    pub fn new(path: &str, capacity: usize) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -27,15 +27,18 @@ impl AtomicBuffer {
         })
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<usize> {
+    // High-performance append: perform memcpy into pre-allocated mmap
+    // Returns the offset for future lookup
+    pub fn push_record(&self, data: &[u8]) -> Result<usize> {
         let len = data.len();
         let offset = self.tail.fetch_add(len, Ordering::SeqCst);
         
         if offset + len > self.capacity {
             self.tail.fetch_sub(len, Ordering::SeqCst);
-            return Err(anyhow::anyhow!("Capacity limit reached"));
+            return Err(anyhow::anyhow!("Storage capacity reached"));
         }
 
+        // Zero-copy memory write
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.mmap.as_ptr().add(offset) as *mut u8, len);
         }
@@ -43,14 +46,10 @@ impl AtomicBuffer {
         Ok(offset)
     }
 
-    pub fn drain(&self) -> Vec<u8> {
-        let head = self.tail.swap(0, Ordering::SeqCst);
-        let mut data = vec![0u8; head];
-        data.copy_from_slice(&self.mmap[..head]);
-        data
-    }
-
-    pub fn len(&self) -> usize {
-        self.tail.load(Ordering::SeqCst)
+    // Zero-copy read: return slice of existing memory
+    pub fn get_record(&self, offset: usize, len: usize) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(self.mmap.as_ptr().add(offset), len)
+        }
     }
 }

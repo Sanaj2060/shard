@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use crate::buffer::AtomicBuffer;
 use crate::wal::Wal;
-use crate::ghost::ShardGhost;
 use std::sync::Arc;
 use tokio::fs;
 
@@ -20,6 +19,7 @@ pub struct Daemon {
     wal: Arc<Wal>,
     pub config: ShardConfig,
     backing_path: PathBuf,
+    processed_files: Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
 impl Daemon {
@@ -31,64 +31,52 @@ impl Daemon {
             wal, 
             config, 
             backing_path,
+            processed_files: Arc::new(std::sync::Mutex::new(Vec::new())) 
         })
     }
 
+    #[cfg(feature = "fuse")]
     pub async fn mount(&self, mount_point: PathBuf) -> Result<()> {
-        let ghost = ShardGhost {
+        let ghost = crate::ghost::ShardGhost {
             buffer: self.buffer.clone(),
             wal: self.wal.clone(),
             rt_handle: tokio::runtime::Handle::current(),
         };
 
-        // FUSE Mount options
-        let options = vec![
-            fuser::MountOption::AutoUnmount, 
-            fuser::MountOption::AllowOther
-        ];
+        let options = vec![fuser::MountOption::AutoUnmount, fuser::MountOption::AllowOther];
         
-        // Spawn asynchronous periodic background flusher
         let daemon_clone = self.clone();
-        let flush_interval = self.config.flush_interval_secs;
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(flush_interval)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(daemon_clone.config.flush_interval_secs)).await;
                 let _ = daemon_clone.flush().await;
             }
         });
 
-        // fuser::mount2 is a blocking thread, run it on a blocking task
-        println!("Shard Ghost Virtual Filesystem is intercepting at: {}", mount_point.display());
         tokio::task::spawn_blocking(move || {
-            fuser::mount2(ghost, mount_point, &options).expect("Failed to mount FUSE. Ensure macFUSE/libfuse is installed.");
+            fuser::mount2(ghost, mount_point, &options).expect("Failed to mount FUSE.");
         }).await?;
 
         Ok(())
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let data = self.buffer.drain();
-        if data.is_empty() { return Ok(()); }
+        let (data, files_to_delete) = {
+            let mut files = self.processed_files.lock().unwrap();
+            let data = self.buffer.drain();
+            if data.is_empty() { return Ok(()); }
+            
+            let files_to_delete: Vec<PathBuf> = files.drain(..).collect();
+            (data, files_to_delete)
+        };
         
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
         let final_name = self.backing_path.join(format!("shard_block_{}.json", ts));
         
         fs::write(&final_name, data).await?;
-        println!("Flushed block: {}", final_name.display());
-        Ok(())
-    }
-
-    pub async fn process_file(&self, path: PathBuf) -> Result<()> {
-        let metadata = fs::metadata(&path).await?;
-        if metadata.len() > (64 * 1024 * 1024) || metadata.len() == 0 { return Ok(()); }
-
-        let data = fs::read(&path).await?;
-        self.wal.append(&data).await?;
         
-        if self.buffer.write(&data).is_ok() {
-            // Logic to track processed files would go here
-        } else {
-            self.flush().await?;
+        for f in files_to_delete {
+            let _ = fs::remove_file(f).await;
         }
         Ok(())
     }

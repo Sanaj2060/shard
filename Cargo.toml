@@ -19,14 +19,27 @@ thiserror = "1.0"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
+notify = "6.1"
 walkdir = "2.5"
 ctrlc = "3.4"
 crc32fast = "1.3"
-fuser = "0.14" # FUSE filesystem library added
+fuser = { version = "0.14", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rio = "0.9"
+[features]
+default = []
+fuse = ["fuser"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "ingestion"
+harness = false
 
 [[bin]]
 name = "shard"
 path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rio = "0.9"
+inotify = "0.10"

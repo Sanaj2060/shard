@@ -1,7 +1,9 @@
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 
-mod daemon; mod stitcher; mod buffer; mod wal; mod reporter; mod ghost;
+mod daemon; mod stitcher; mod wal; mod reporter; mod storage; mod buffer;
+#[cfg(feature = "fuse")]
+mod ghost;
 
 #[derive(Parser)]
 #[command(name = "shard", about = "Unix-native FUSE write-aggregator")]
@@ -45,6 +47,7 @@ async fn main() -> Result<()> {
             println!("Starting Shard. Backing blocks will write to: {}", backing_buf.display());
             
             // This will block and keep the process alive while FUSE intercepts
+            #[cfg(feature = "fuse")]
             daemon.mount(mount_buf).await?;
         }
         Commands::Scan { path } => {
